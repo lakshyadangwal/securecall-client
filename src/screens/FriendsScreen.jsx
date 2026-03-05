@@ -21,8 +21,12 @@ export default function FriendsScreen({
 
   const typingTimer = useRef(null);
   const chatEndRef = useRef(null);
-  const friendIdSetRef = useRef(new Set());
   const inputRef = useRef(null);
+
+  // Store friend IDs (accepted only) for presence filtering
+  const friendIdSetRef = useRef(new Set());
+  // Store ALL server-reported online IDs — we filter against friends separately
+  const allOnlineRef = useRef(new Set());
 
   useEffect(() => {
     const onResize = () => setMobile(isMobile());
@@ -30,53 +34,97 @@ export default function FriendsScreen({
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
+  // Recompute which friends are online from the global online set
+  const recomputeOnline = useCallback(() => {
+    const result = new Set(
+      Array.from(allOnlineRef.current).filter((id) => friendIdSetRef.current.has(id))
+    );
+    setOnlineIds(result);
+  }, []);
+
   const loadFriends = useCallback(async () => {
     try {
       const data = await api.getFriends(token);
       const accepted = data.filter((f) => f.status === "accepted");
       setFriends(data);
-      const idSet = new Set(accepted.map((f) => Number(f.id)));
-      friendIdSetRef.current = idSet;
-      if (idSet.size > 0) socket.emit("get-presence", Array.from(idSet));
-    } catch (e) { console.error(e); }
+
+      // Update friend ID set
+      friendIdSetRef.current = new Set(accepted.map((f) => Number(f.id)));
+
+      // Recompute online from already-known online IDs
+      recomputeOnline();
+
+      // Also ask server explicitly (belt and suspenders)
+      if (friendIdSetRef.current.size > 0) {
+        socket.emit("get-presence", Array.from(friendIdSetRef.current));
+      }
+    } catch (e) {
+      console.error("loadFriends:", e);
+    }
     setLoading(false);
-  }, [token, socket]);
+  }, [token, socket, recomputeOnline]);
 
   useEffect(() => {
     loadFriends();
 
+    // Server sends ALL online user IDs when we connect
+    // Store them all, then filter to friends
     socket.on("all-online-users", (allIds) => {
-      const online = allIds.map(Number).filter((id) => friendIdSetRef.current.has(id));
-      setOnlineIds(new Set(online));
+      console.log("[PRESENCE] all-online-users:", allIds);
+      allOnlineRef.current = new Set(allIds.map(Number));
+      recomputeOnline();
     });
 
-    socket.on("presence-list", (ids) => setOnlineIds(new Set(ids.map(Number))));
+    // Server responds to our get-presence request with filtered list
+    socket.on("presence-list", (ids) => {
+      console.log("[PRESENCE] presence-list:", ids);
+      // Merge into allOnline
+      ids.map(Number).forEach((id) => allOnlineRef.current.add(id));
+      recomputeOnline();
+    });
 
+    // A user came online
     socket.on("user-online", ({ userId }) => {
       const uid = Number(userId);
-      if (friendIdSetRef.current.has(uid)) setOnlineIds((p) => new Set([...p, uid]));
+      console.log("[PRESENCE] user-online:", uid);
+      allOnlineRef.current.add(uid);
+      recomputeOnline();
     });
 
+    // A user went offline
     socket.on("user-offline", ({ userId }) => {
-      setOnlineIds((p) => { const s = new Set(p); s.delete(Number(userId)); return s; });
+      const uid = Number(userId);
+      console.log("[PRESENCE] user-offline:", uid);
+      allOnlineRef.current.delete(uid);
+      recomputeOnline();
     });
 
+    // Typing indicator
     socket.on("peer-typing", ({ fromUserId, isTyping }) => {
-      setOpenChat((cur) => { if (cur && Number(fromUserId) === Number(cur.id)) setPeerTyping(isTyping); return cur; });
+      setOpenChat((cur) => {
+        if (cur && Number(fromUserId) === Number(cur.id)) setPeerTyping(isTyping);
+        return cur;
+      });
     });
 
+    // Refresh presence every 8 seconds
     const interval = setInterval(() => {
-      const ids = Array.from(friendIdSetRef.current);
-      if (ids.length > 0) socket.emit("get-presence", ids);
-    }, 15000);
+      if (friendIdSetRef.current.size > 0) {
+        socket.emit("get-presence", Array.from(friendIdSetRef.current));
+      }
+    }, 8000);
 
     return () => {
-      socket.off("all-online-users"); socket.off("presence-list");
-      socket.off("user-online"); socket.off("user-offline"); socket.off("peer-typing");
+      socket.off("all-online-users");
+      socket.off("presence-list");
+      socket.off("user-online");
+      socket.off("user-offline");
+      socket.off("peer-typing");
       clearInterval(interval);
     };
-  }, [socket, loadFriends]);
+  }, [socket, loadFriends, recomputeOnline]);
 
+  // Scroll chat to bottom
   useEffect(() => {
     setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
   }, [conversations, openChat]);
@@ -88,8 +136,6 @@ export default function FriendsScreen({
     setPeerTyping(false);
     setTimeout(() => inputRef.current?.focus(), 100);
   };
-
-  const closeChat = () => setOpenChat(null);
 
   const sendMessage = () => {
     const text = chatInput.trim();
@@ -105,7 +151,9 @@ export default function FriendsScreen({
     if (!openChat) return;
     socket.emit("typing", { toUserId: openChat.id, isTyping: true });
     clearTimeout(typingTimer.current);
-    typingTimer.current = setTimeout(() => socket.emit("typing", { toUserId: openChat.id, isTyping: false }), 1500);
+    typingTimer.current = setTimeout(() => {
+      socket.emit("typing", { toUserId: openChat.id, isTyping: false });
+    }, 1500);
   };
 
   const addFriend = async () => {
@@ -119,10 +167,12 @@ export default function FriendsScreen({
   };
 
   const acceptFriend = async (userId) => { await api.acceptFriend(userId, token); loadFriends(); };
+
   const removeFriend = async (userId) => {
     await api.removeFriend(userId, token);
     setFriends((f) => f.filter((fr) => fr.id !== userId));
     friendIdSetRef.current.delete(Number(userId));
+    recomputeOnline();
     if (openChat?.id === userId) setOpenChat(null);
   };
 
@@ -131,15 +181,15 @@ export default function FriendsScreen({
   const incomingPending = pending.filter((f) => Number(f.requester_id) !== Number(user.id));
   const outgoingPending = pending.filter((f) => Number(f.requester_id) === Number(user.id));
   const totalUnread = Object.values(unread).reduce((a, b) => a + b, 0);
+
   const sortedFriends = [...accepted].sort((a, b) => {
     const ao = onlineIds.has(Number(a.id)), bo = onlineIds.has(Number(b.id));
     if (ao && !bo) return -1; if (!ao && bo) return 1;
     return a.username.localeCompare(b.username);
   });
+
   const msgs = openChat ? (conversations[Number(openChat.id)] || []) : [];
   const chatFriendOnline = openChat ? onlineIds.has(Number(openChat.id)) : false;
-
-  // On mobile: show chat panel OR friends list, not both
   const showList = !mobile || !openChat;
   const showChat = !!openChat;
 
@@ -154,12 +204,8 @@ export default function FriendsScreen({
 
       {/* ═══════════ FRIENDS LIST ═══════════ */}
       {showList && (
-        <div style={{
-          display: "grid", gridTemplateRows: "auto 1fr",
-          height: "100%",
-          borderRight: !mobile && openChat ? "1px solid rgba(255,255,255,0.06)" : "none",
-          background: "#060608",
-        }}>
+        <div style={{ display: "grid", gridTemplateRows: "auto 1fr", height: "100%", borderRight: !mobile && openChat ? "1px solid rgba(255,255,255,0.06)" : "none", background: "#060608" }}>
+
           {/* Header */}
           <div style={{ padding: "14px 14px 0", borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "12px" }}>
@@ -177,7 +223,6 @@ export default function FriendsScreen({
               <button className="btn btn-ghost" onClick={onLogout} style={{ padding: "6px 12px", fontSize: "0.62rem" }}>Sign Out</button>
             </div>
 
-            {/* Add friend */}
             <div style={{ marginBottom: "12px" }}>
               <div style={{ display: "flex", gap: "6px" }}>
                 <input className="input" placeholder="Add friend by username..."
@@ -190,26 +235,16 @@ export default function FriendsScreen({
               {addSuccess && <div style={{ fontFamily: "'Space Mono', monospace", fontSize: "0.56rem", color: "#00ff88", marginTop: "4px" }}>✓ {addSuccess}</div>}
             </div>
 
-            {/* Tabs */}
             <div style={{ display: "flex", alignItems: "center" }}>
-              {[
-                { id: "friends", label: `Friends (${accepted.length})` },
-                { id: "pending", label: `Pending${incomingPending.length ? " ●" : ""}` },
-              ].map(({ id, label }) => (
+              {[{ id: "friends", label: `Friends (${accepted.length})` }, { id: "pending", label: `Pending${incomingPending.length ? " ●" : ""}` }].map(({ id, label }) => (
                 <button key={id} onClick={() => setTab(id)} style={{
                   fontFamily: "'Space Mono', monospace", fontSize: "0.56rem", letterSpacing: "0.1em",
-                  textTransform: "uppercase", padding: "8px 12px",
-                  background: "transparent", border: "none",
+                  textTransform: "uppercase", padding: "8px 12px", background: "transparent", border: "none",
                   borderBottom: tab === id ? "2px solid #00ff88" : "2px solid transparent",
-                  color: tab === id ? "#00ff88" : "rgba(255,255,255,0.3)",
-                  cursor: "pointer", transition: "all 0.15s",
+                  color: tab === id ? "#00ff88" : "rgba(255,255,255,0.3)", cursor: "pointer", transition: "all 0.15s",
                 }}>{label}</button>
               ))}
-              {totalUnread > 0 && (
-                <span style={{ marginLeft: "auto", background: "#ff4466", color: "#fff", borderRadius: "10px", fontFamily: "'Space Mono', monospace", fontSize: "0.46rem", padding: "2px 7px" }}>
-                  {totalUnread} new
-                </span>
-              )}
+              {totalUnread > 0 && <span style={{ marginLeft: "auto", background: "#ff4466", color: "#fff", borderRadius: "10px", fontFamily: "'Space Mono', monospace", fontSize: "0.46rem", padding: "2px 7px" }}>{totalUnread} new</span>}
             </div>
           </div>
 
@@ -235,8 +270,7 @@ export default function FriendsScreen({
                       padding: "11px 10px", marginBottom: "4px", cursor: "pointer",
                       background: isOpen ? "rgba(0,255,136,0.06)" : "rgba(255,255,255,0.02)",
                       border: `1px solid ${isOpen ? "rgba(0,255,136,0.2)" : "rgba(255,255,255,0.05)"}`,
-                      transition: "all 0.12s", animation: "slide-up 0.2s ease",
-                      WebkitTapHighlightColor: "transparent",
+                      transition: "all 0.12s", WebkitTapHighlightColor: "transparent",
                     }}>
                       <div style={{ width: "38px", height: "38px", borderRadius: "50%", flexShrink: 0, background: isOnline ? "rgba(0,255,136,0.08)" : "rgba(255,255,255,0.03)", border: `1px solid ${isOnline ? "rgba(0,255,136,0.2)" : "rgba(255,255,255,0.06)"}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "1.1rem", position: "relative" }}>
                         {friend.avatar || "👤"}
@@ -294,13 +328,10 @@ export default function FriendsScreen({
 
       {/* ═══════════ CHAT PANEL ═══════════ */}
       {showChat && (
-        <div style={{
-          display: "grid", gridTemplateRows: "auto 1fr auto",
-          height: "100%", background: "#070712",
-        }}>
-          {/* Chat header */}
+        <div style={{ display: "grid", gridTemplateRows: "auto 1fr auto", height: "100%", background: "#070712" }}>
+
           <div style={{ padding: "12px 14px", borderBottom: "1px solid rgba(255,255,255,0.05)", display: "flex", alignItems: "center", gap: "10px", background: "rgba(0,0,0,0.3)" }}>
-            <button className="btn btn-ghost" onClick={closeChat} style={{ padding: "7px 12px", fontSize: "0.7rem", flexShrink: 0 }}>←</button>
+            <button className="btn btn-ghost" onClick={() => setOpenChat(null)} style={{ padding: "7px 12px", fontSize: "0.7rem", flexShrink: 0 }}>←</button>
             <div style={{ width: "34px", height: "34px", borderRadius: "50%", flexShrink: 0, background: chatFriendOnline ? "rgba(0,255,136,0.08)" : "rgba(255,255,255,0.03)", border: `1px solid ${chatFriendOnline ? "rgba(0,255,136,0.2)" : "rgba(255,255,255,0.07)"}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: "1rem", position: "relative" }}>
               {openChat.avatar || "👤"}
               <span style={{ position: "absolute", bottom: 0, right: 0, width: "9px", height: "9px", borderRadius: "50%", background: chatFriendOnline ? "#00ff88" : "#1a1a2a", boxShadow: chatFriendOnline ? "0 0 5px #00ff88" : "none", border: "2px solid #070712" }} />
@@ -316,48 +347,33 @@ export default function FriendsScreen({
             )}
           </div>
 
-          {/* Messages */}
           <div style={{ overflowY: "auto", padding: "14px 14px 8px", display: "flex", flexDirection: "column", gap: "5px" }}>
             {msgs.length === 0 && (
               <div style={{ textAlign: "center", marginTop: "80px" }}>
                 <div style={{ fontSize: "2.5rem", marginBottom: "14px" }}>💬</div>
                 <div style={{ fontFamily: "'Space Mono', monospace", fontSize: "0.6rem", color: "rgba(255,255,255,0.18)", lineHeight: 2 }}>
                   No messages yet.<br />
-                  <span style={{ color: "rgba(0,255,136,0.35)" }}>
-                    {chatFriendOnline ? "Say hello!" : "Send a message — they'll see it when online."}
-                  </span>
+                  <span style={{ color: "rgba(0,255,136,0.35)" }}>{chatFriendOnline ? "Say hello!" : "Send a message — they'll see it when online."}</span>
                 </div>
               </div>
             )}
-
             {msgs.map((msg, i) => {
               const showDate = i === 0 || new Date(msg.ts).toDateString() !== new Date(msgs[i - 1]?.ts).toDateString();
               return (
                 <div key={i}>
-                  {showDate && (
-                    <div style={{ textAlign: "center", fontFamily: "'Space Mono', monospace", fontSize: "0.46rem", color: "rgba(255,255,255,0.12)", letterSpacing: "0.1em", margin: "8px 0 4px", textTransform: "uppercase" }}>
-                      {new Date(msg.ts).toLocaleDateString()}
-                    </div>
-                  )}
+                  {showDate && <div style={{ textAlign: "center", fontFamily: "'Space Mono', monospace", fontSize: "0.46rem", color: "rgba(255,255,255,0.12)", letterSpacing: "0.1em", margin: "8px 0 4px", textTransform: "uppercase" }}>{new Date(msg.ts).toLocaleDateString()}</div>}
                   <div style={{ display: "flex", flexDirection: "column", alignItems: msg.mine ? "flex-end" : "flex-start", animation: "slide-up 0.18s ease" }}>
                     <div style={{ maxWidth: "80%", padding: "9px 13px", background: msg.mine ? "rgba(0,255,136,0.09)" : "rgba(255,255,255,0.05)", border: `1px solid ${msg.mine ? "rgba(0,255,136,0.22)" : "rgba(255,255,255,0.09)"}`, fontFamily: "'Syne', sans-serif", fontSize: "0.9rem", lineHeight: 1.55, color: msg.mine ? "#d0ffe8" : "#c8c8d8", borderBottomRightRadius: msg.mine ? 0 : "2px", borderBottomLeftRadius: !msg.mine ? 0 : "2px", wordBreak: "break-word" }}>
                       {msg.message}
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: "4px", marginTop: "3px" }}>
-                      <span style={{ fontFamily: "'Space Mono', monospace", fontSize: "0.44rem", color: "rgba(255,255,255,0.13)" }}>
-                        {new Date(msg.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                      </span>
-                      {msg.mine && (
-                        <span style={{ fontSize: "0.6rem", color: msg.status === "sent" ? "#00ff88" : msg.status === "offline" ? "#ff9944" : "rgba(255,255,255,0.2)" }}>
-                          {msg.status === "sent" ? "✓✓" : msg.status === "offline" ? "✓" : "·"}
-                        </span>
-                      )}
+                      <span style={{ fontFamily: "'Space Mono', monospace", fontSize: "0.44rem", color: "rgba(255,255,255,0.13)" }}>{new Date(msg.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
+                      {msg.mine && <span style={{ fontSize: "0.6rem", color: msg.status === "sent" ? "#00ff88" : msg.status === "offline" ? "#ff9944" : "rgba(255,255,255,0.2)" }}>{msg.status === "sent" ? "✓✓" : msg.status === "offline" ? "✓" : "·"}</span>}
                     </div>
                   </div>
                 </div>
               );
             })}
-
             {peerTyping && (
               <div style={{ display: "flex", alignItems: "center", gap: "5px", padding: "8px 12px", alignSelf: "flex-start", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.07)", width: "fit-content" }}>
                 {[0, 1, 2].map((i) => <div key={i} style={{ width: "5px", height: "5px", borderRadius: "50%", background: "rgba(0,255,136,0.6)", animation: `blink 1.2s ${i * 0.22}s ease-in-out infinite` }} />)}
@@ -366,19 +382,13 @@ export default function FriendsScreen({
             <div ref={chatEndRef} />
           </div>
 
-          {/* Input */}
           <div style={{ padding: "10px 12px", borderTop: "1px solid rgba(255,255,255,0.05)", display: "flex", gap: "8px", background: "rgba(0,0,0,0.4)" }}>
-            <input
-              ref={inputRef}
-              className="input"
+            <input ref={inputRef} className="input"
               placeholder={chatFriendOnline ? `Message ${openChat.username}...` : "Offline — message anyway"}
-              value={chatInput}
-              onChange={handleTyping}
+              value={chatInput} onChange={handleTyping}
               onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && sendMessage()}
-              style={{ fontSize: "0.85rem" }}
-            />
-            <button className="btn btn-green" onClick={sendMessage}
-              disabled={!chatInput.trim()} style={{ padding: "0 16px", flexShrink: 0 }}>→</button>
+              style={{ fontSize: "0.85rem" }} />
+            <button className="btn btn-green" onClick={sendMessage} disabled={!chatInput.trim()} style={{ padding: "0 16px", flexShrink: 0 }}>→</button>
           </div>
         </div>
       )}
